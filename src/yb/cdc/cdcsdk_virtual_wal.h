@@ -41,7 +41,8 @@ class CDCSDKVirtualWAL {
   using TabletRecordInfoPair = std::pair<TabletId, RecordInfo>;
 
   using RetryableErrorPattern = std::pair<Status::Code, std::string>;
-  // Pairs of error code and error msg pattern used to identify errors that will be retried.
+  // Pairs of error code and error msg pattern used to identify errors that will be retried. An
+  // empty pattern matches every message of its code.
   // Everytime a new error is made retriable for virtual WAL by adding it to
   // kRetryableErrorPatterns, it should also be added to the test
   // CDCSDKConsumptionConsistentChangesTest.TestRetryableErrorsNotSentToWalsender
@@ -51,7 +52,12 @@ class CDCSDKVirtualWAL {
       {Status::Code::kNotFound, "Not leader for"},
       {Status::Code::kLeaderNotReadyToServe, "Not ready to serve"},
       {Status::Code::kNotFound, "Footer for segment"},
-      {Status::Code::kIllegalState, "LogReader is not initialized"}};
+      {Status::Code::kIllegalState, "LogReader is not initialized"},
+      // A GetChanges that timed out read nothing, so the next one asks again from the same
+      // checkpoint. Timeouts come while the master leader or a tablet's leader is unreachable:
+      // the stream's metadata lookup (GetCDCStream), or the forwarded poll of the master's catalog
+      // tablet, which passes its deadline.
+      {Status::Code::kTimedOut, ""}};
 
   Status InitVirtualWALInternal(
       std::unordered_set<TableId> table_list,

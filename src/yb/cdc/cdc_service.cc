@@ -1018,6 +1018,23 @@ CoarseTimePoint GetDeadline(const RpcContext& context, client::YBClient* client)
   return deadline;
 }
 
+// The deadline for the calls the virtual WAL makes while answering one GetConsistentChanges: its
+// GetChanges on each tablet, including the poll of the master's catalog tablet that is forwarded to
+// the master leader. They end before the walsender's own deadline, as CdcProducer::GetChanges ends
+// before CDCServiceImpl::GetChanges, so that a timeout among them is answered as a retryable empty
+// response instead of the walsender's call timing out with no answer.
+CoarseTimePoint GetVirtualWALDeadline(CoarseTimePoint deadline) {
+  const auto remaining = deadline - CoarseMonoClock::Now();
+  if (remaining <= CoarseDuration::zero()) {
+    return deadline;
+  }
+  const auto margin = std::min<CoarseDuration>(
+      std::chrono::duration_cast<CoarseDuration>(
+          FLAGS_cdc_read_rpc_timeout_ms * 1ms * FLAGS_cdc_read_safe_deadline_ratio),
+      remaining / 2);
+  return deadline - margin;
+}
+
 Status VerifyArg(const SetCDCCheckpointRequestPB& req) {
   if (!req.has_checkpoint() && !req.has_bootstrap()) {
     return STATUS(InvalidArgument, "OpId is required to set checkpoint");
@@ -5714,8 +5731,8 @@ void CDCServiceImpl::GetConsistentChanges(
         CDCErrorPB::INTERNAL_ERROR, context);
   }
 
-  Status s =
-      virtual_wal->GetConsistentChangesInternal(resp, hostport, GetDeadline(context, client()));
+  Status s = virtual_wal->GetConsistentChangesInternal(
+      resp, hostport, GetVirtualWALDeadline(GetDeadline(context, client())));
   if (!s.ok()) {
     std::string msg =
         Format("GetConsistentChanges failed for stream_id: $0 with error: $1", stream_id, s);

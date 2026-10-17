@@ -133,7 +133,9 @@ using RollBackTabletIdCheckpointMap = std::unordered_map<const std::string*, Rol
   TEST_SIMULATE_ERROR( \
       PeerNotReadyToServe, 3, LeaderNotReadyToServe, "Not ready to serve requested tablet id") \
   TEST_SIMULATE_ERROR(LogSegmentFooterNotFound, 4, NotFound, "Footer for segment not found") \
-  TEST_SIMULATE_ERROR(LogReaderNotInitialized, 5, IllegalState, "LogReader is not initialized")
+  TEST_SIMULATE_ERROR(LogReaderNotInitialized, 5, IllegalState, "LogReader is not initialized") \
+  TEST_SIMULATE_ERROR( \
+      MasterRpcTimedOut, 6, TimedOut, "GetCDCStream timed out after deadline expired")
 
 enum TestSimulateErrorCode : int32_t {
 #define TEST_SIMULATE_ERROR(name, value, status_code, message) name = value,
