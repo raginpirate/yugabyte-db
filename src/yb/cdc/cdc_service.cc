@@ -5820,11 +5820,28 @@ void CDCServiceImpl::DestroyVirtualWALBatchForCDC(
     }
   }
 
-  // Persist outside mutex_, see DestroyVirtualWALForCDC.
+  // Persist outside mutex_, see DestroyVirtualWALForCDC, and without waiting for the write: this
+  // runs on the tablet server's IO thread pool (PgClientServiceImpl::SessionsRemoved, from the
+  // session registry's expiry check). While cdc_state has no majority the write cannot commit,
+  // and a cleanup waiting for it would hold its IO thread until the write's deadline, or until a
+  // leader change aborts it; with every IO thread held, the node could not reach the peers whose
+  // votes would make that leader change (#12173).
+  std::vector<CDCStateTableEntry> entries;
+  entries.reserve(stream_ids.size());
   for (const auto& stream_id : stream_ids) {
-    if (!PersistActivePidInSlotEntry(stream_id, 0ULL).ok()) {
-      VLOG(2) << "Failed to reset active_pid for stream_id: " << stream_id;
-    }
+    auto& entry = entries.emplace_back(kCDCSDKSlotEntryTabletId, stream_id);
+    entry.active_pid = 0;
+  }
+  auto s = cdc_state_table_->UpdateEntriesAsync(
+      entries, [streams = AsString(stream_ids)](const Status& status) {
+        if (!status.ok()) {
+          LOG(WARNING) << "Failed to reset active_pid for stream_ids: " << streams << ": "
+                       << status;
+        }
+      });
+  if (!s.ok()) {
+    LOG(WARNING) << "Failed to reset active_pid for stream_ids: " << AsString(stream_ids) << ": "
+                 << s;
   }
 }
 

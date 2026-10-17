@@ -159,6 +159,9 @@ class CDCStateTable {
   Status UpdateEntries(
       const std::vector<CDCStateTableEntry>& entries, const bool replace_full_map = false,
       const std::vector<std::string>& keys_to_delete = {}) EXCLUDES(mutex_);
+  // Updates the entries without waiting for the write: the callback is called with its result.
+  Status UpdateEntriesAsync(
+      const std::vector<CDCStateTableEntry>& entries, StdStatusCallback callback) EXCLUDES(mutex_);
   Status UpsertEntries(
       const std::vector<CDCStateTableEntry>& entries, const bool replace_full_map = false,
       const std::vector<std::string>& keys_to_delete = {}) EXCLUDES(mutex_);
