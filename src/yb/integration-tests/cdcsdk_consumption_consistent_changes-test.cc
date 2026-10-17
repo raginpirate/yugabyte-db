@@ -20,6 +20,7 @@
 #include "yb/integration-tests/cdcsdk_ysql_test_base.h"
 #include "yb/tserver/ts_tablet_manager.h"
 #include "yb/util/flags.h"
+#include "yb/util/logging_test_util.h"
 #include "yb/util/test_macros.h"
 
 namespace yb {
@@ -90,6 +91,72 @@ TEST_F(CDCSDKConsumptionConsistentChangesTest, TestVirtualWAL) {
 
   // Sending a different session_id for which VirtualWAL does not exist should result in error.
   ASSERT_NOK(GetConsistentChangesFromCDC(stream_id, kVWALSessionId3));
+}
+
+// The expired-session cleanup (PgClientServiceImpl::SessionsRemoved) runs on the tablet server's IO
+// thread pool and resets the slot's active_pid in cdc_state. It must not wait for that write: while
+// cdc_state has no majority the write cannot commit, and a waiting cleanup held its IO thread until
+// the write's deadline (#12173). The write's result is still reported once cdc_state is back.
+TEST_F(CDCSDKConsumptionConsistentChangesTest, TestVirtualWALBatchCleanupDoesNotWaitForCDCState) {
+  ASSERT_OK(SetUpWithParams(3 /* rf */, 1 /* num_masters */, false /* colocated */));
+  auto table = ASSERT_RESULT(CreateTable(&test_cluster_, test_namespace_name, kTableName));
+  auto stream_id = ASSERT_RESULT(CreateConsistentSnapshotStreamWithReplicationSlot());
+
+  auto read_active_pid = [&]() -> Result<uint64_t> {
+    auto cdc_state_table = MakeCDCStateTable(test_client());
+    auto entry = VERIFY_RESULT(cdc_state_table.TryFetchEntry(
+        {kCDCSDKSlotEntryTabletId, stream_id}, CDCStateTableEntrySelector().IncludeActivePid()));
+    SCHECK(entry && entry->active_pid, NotFound, "No active_pid in the slot's cdc_state entry");
+    return *entry->active_pid;
+  };
+
+  // Start the virtual WAL as a walsender does, with the pid that cdc_state records as active.
+  constexpr uint64_t kActivePid = 4242;
+  InitVirtualWALForCDCRequestPB init_req;
+  init_req.set_stream_id(stream_id.ToString());
+  init_req.set_session_id(kVWALSessionId1);
+  init_req.add_table_id(table.table_id());
+  init_req.set_active_pid(kActivePid);
+  ASSERT_OK(WaitFor(
+      [&]() -> Result<bool> {
+        InitVirtualWALForCDCResponsePB init_resp;
+        RpcController init_rpc;
+        auto status = cdc_proxy_->InitVirtualWALForCDC(init_req, &init_resp, &init_rpc);
+        return status.ok() && !init_resp.has_error();
+      },
+      MonoDelta::FromSeconds(kRpcTimeout), "InitVirtualWALForCDC"));
+  ASSERT_EQ(ASSERT_RESULT(read_active_pid()), kActivePid);
+
+  // cdc_state loses its majority: only the tablet server holding the virtual WAL stays up.
+  for (size_t i = 1; i < test_cluster()->num_tablet_servers(); ++i) {
+    test_cluster()->mini_tablet_server(i)->Shutdown();
+  }
+
+  StringWaiterLogSink reset_failed("Failed to reset active_pid for stream_ids");
+  auto cdc_service = test_cluster()->mini_tablet_server(0)->server()->GetCDCService();
+  const auto start = MonoTime::Now();
+  cdc_service->DestroyVirtualWALBatchForCDC({kVWALSessionId1});
+  const auto elapsed = MonoTime::Now() - start;
+  // Waiting for the write took until the tablet server's client timeout
+  // (tserver_yb_client_default_timeout_ms, 60 s), or until a leader change aborted it.
+  ASSERT_LT(elapsed, MonoDelta::FromSeconds(5 * kTimeMultiplier));
+  // The virtual WAL is gone at once.
+  ASSERT_NOK_STR_CONTAINS(
+      GetConsistentChangesFromCDC(stream_id), "Virtual WAL instance not found");
+
+  for (size_t i = 1; i < test_cluster()->num_tablet_servers(); ++i) {
+    ASSERT_OK(test_cluster()->mini_tablet_server(i)->RestartStoppedServer());
+  }
+  // The write either lands or reports its failure; it is never left waiting.
+  ASSERT_OK(WaitFor(
+      [&]() -> Result<bool> {
+        if (reset_failed.IsEventOccurred()) {
+          return true;
+        }
+        auto active_pid = read_active_pid();
+        return active_pid.ok() && *active_pid == 0;
+      },
+      MonoDelta::FromSeconds(kRpcTimeout * 2), "The active_pid reset neither landed nor failed"));
 }
 
 TEST_F(CDCSDKConsumptionConsistentChangesTest, TestExplicitCheckpointForSingleShardTxn) {

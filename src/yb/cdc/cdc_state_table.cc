@@ -672,6 +672,13 @@ Status CDCStateTable::UpdateEntries(
       entries, QLWriteRequestPB::QL_STMT_UPDATE, QL_OP_EXISTS, replace_full_map, keys_to_delete);
 }
 
+Status CDCStateTable::UpdateEntriesAsync(
+    const std::vector<CDCStateTableEntry>& entries, StdStatusCallback callback) {
+  VLOG_WITH_FUNC(1) << yb::ToString(entries);
+  return WriteEntriesAsync(
+      entries, QLWriteRequestPB::QL_STMT_UPDATE, std::move(callback), QL_OP_EXISTS);
+}
+
 Status CDCStateTable::UpsertEntries(
     const std::vector<CDCStateTableEntry>& entries, const bool replace_full_map,
     const std::vector<std::string>& keys_to_delete) {
