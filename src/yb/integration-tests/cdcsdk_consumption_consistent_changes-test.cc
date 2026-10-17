@@ -13,8 +13,10 @@
 #include "yb/cdc/cdc_service.pb.h"
 #include "yb/cdc/cdc_state_table.h"
 #include "yb/integration-tests/cdcsdk_ysql_test_base.h"
+#include "yb/master/sys_catalog_constants.h"
 #include "yb/tserver/ts_tablet_manager.h"
 #include "yb/util/flags.h"
+#include "yb/util/logging_test_util.h"
 #include "yb/util/test_macros.h"
 
 namespace yb {
@@ -2989,7 +2991,8 @@ TEST_F(CDCSDKConsumptionConsistentChangesTest, TestRetryableErrorsNotSentToWalse
       TestSimulateErrorCode::PeerNotLeader,
       TestSimulateErrorCode::PeerNotReadyToServe,
       TestSimulateErrorCode::LogSegmentFooterNotFound,
-      TestSimulateErrorCode::LogReaderNotInitialized};
+      TestSimulateErrorCode::LogReaderNotInitialized,
+      TestSimulateErrorCode::MasterRpcTimedOut};
 
   for (auto error_code : error_codes) {
     // Setting the flag to mimic retryable errors. The expectation is that
@@ -2999,6 +3002,50 @@ TEST_F(CDCSDKConsumptionConsistentChangesTest, TestRetryableErrorsNotSentToWalse
     auto change_resp = ASSERT_RESULT(GetConsistentChangesFromCDC(stream_id));
     ASSERT_FALSE(change_resp.has_error());
   }
+}
+
+// While the master is unreachable, the virtual WAL's poll of the master's catalog tablet times out.
+// GetConsistentChanges must answer within the walsender's deadline with no records and no error,
+// so that the walsender (or the notifications poller, #31484) polls again instead of exiting, and
+// the stream must deliver the next change once the master is back.
+TEST_F(CDCSDKConsumptionConsistentChangesTest, TestTimeoutsNotSentToWalsenderWhileMasterIsDown) {
+  ASSERT_OK(SetUpWithParams(1 /* rf */, 1 /* num_masters */, false /* colocated */));
+  auto table = ASSERT_RESULT(CreateTable(&test_cluster_, test_namespace_name, kTableName));
+  auto stream_id = ASSERT_RESULT(CreateConsistentSnapshotStreamWithReplicationSlot());
+  ASSERT_OK(InitVirtualWAL(stream_id, {table.table_id()}));
+
+  ASSERT_OK(WriteRows(0 /* start */, 1 /* end */, &test_cluster_));
+  auto before = ASSERT_RESULT(GetAllPendingTxnsFromVirtualWAL(
+      stream_id, {table.table_id()}, 1 /* expected_dml_records */, false /* init_virtual_wal */));
+  ASSERT_EQ(before.record_count[1], 1);
+
+  StringWaiterLogSink catalog_poll_failed(
+      Format("GetChanges failed for tablet_id: $0", master::kSysCatalogTabletId));
+  test_cluster_.mini_cluster_->mini_master()->Shutdown();
+
+  // The walsender's own deadline (pggate's, for both the walsender and the notifications poller).
+  const auto walsender_timeout = MonoDelta::FromSeconds(10 * kTimeMultiplier);
+  GetConsistentChangesRequestPB change_req;
+  change_req.set_stream_id(stream_id.ToString());
+  change_req.set_session_id(kVWALSessionId1);
+  for (int i = 0; i < 3; ++i) {
+    GetConsistentChangesResponsePB change_resp;
+    RpcController rpc;
+    rpc.set_timeout(walsender_timeout);
+    ASSERT_OK(cdc_proxy_->GetConsistentChanges(change_req, &change_resp, &rpc));
+    ASSERT_FALSE(change_resp.has_error()) << change_resp.error().ShortDebugString();
+    ASSERT_EQ(change_resp.cdc_sdk_proto_records_size(), 0);
+  }
+  // The catalog tablet's poll did fail while the master was down: the answers above are the
+  // retried timeouts, not polls that never reached the master.
+  ASSERT_TRUE(catalog_poll_failed.IsEventOccurred());
+
+  ASSERT_OK(test_cluster_.mini_cluster_->StartMasters());
+  ASSERT_OK(test_cluster_.mini_cluster_->WaitForTabletServerCount(1));
+  ASSERT_OK(WriteRows(1 /* start */, 2 /* end */, &test_cluster_));
+  auto after = ASSERT_RESULT(GetAllPendingTxnsFromVirtualWAL(
+      stream_id, {table.table_id()}, 1 /* expected_dml_records */, false /* init_virtual_wal */));
+  ASSERT_EQ(after.record_count[1], 1);
 }
 
 // This test verifies the behaviour of VWAL when the publication refresh interval is changed when
