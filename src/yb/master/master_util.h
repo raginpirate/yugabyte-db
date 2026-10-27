@@ -48,13 +48,16 @@ class RaftPeerPB;
 
 namespace master {
 
-// Given a hostport, return the master server information protobuf.
+// Given the hostports of one master, return its server information protobuf: the first answer
+// among them, or, when expected_permanent_uuid is not empty, the first answer from the master with
+// that permanent uuid (an address another master now answers on is not taken for this one).
 // Does not apply to tablet server.
 Status GetMasterEntryForHosts(
     rpc::ProxyCache* proxy_cache,
     const std::vector<HostPort>& hostports,
     MonoDelta timeout,
-    ServerEntryPB* e);
+    ServerEntryPB* e,
+    const std::string& expected_permanent_uuid = std::string());
 
 const HostPortPB& DesiredHostPort(const TSInfoPB& ts_info, const CloudInfoPB& from);
 

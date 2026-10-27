@@ -560,9 +560,10 @@ Status Master::ListMasters(std::vector<ServerEntryPB>* masters) const {
 
     // Make GetMasterRegistration calls for peer master info.
     ServerEntryPB peer_entry;
+    // Only the peer's own answer: one of its last known addresses may be another master's now.
     Status s = GetMasterEntryForHosts(
         proxy_cache_.get(), addrs, MonoDelta::FromMilliseconds(FLAGS_master_rpc_timeout_ms),
-        &peer_entry);
+        &peer_entry, peer.permanent_uuid());
     if (!s.ok()) {
       // In case of errors talking to the peer master,
       // fill in fields from our catalog best as we can.

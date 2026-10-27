@@ -74,8 +74,10 @@ struct GetMasterRegistrationData {
 };
 
 struct GetMasterRegistrationState {
-  GetMasterRegistrationState(rpc::ProxyCache* proxy_cache, const std::vector<HostPort>& host_ports)
-      : num_pending_rpcs(host_ports.size()) {
+  GetMasterRegistrationState(
+      rpc::ProxyCache* proxy_cache, const std::vector<HostPort>& host_ports,
+      const std::string& expected_permanent_uuid)
+      : expected_permanent_uuid(expected_permanent_uuid), num_pending_rpcs(host_ports.size()) {
     registration_data.reserve(host_ports.size());
     for (const auto& host_port : host_ports) {
       registration_data.emplace_back(proxy_cache, host_port);
@@ -83,12 +85,15 @@ struct GetMasterRegistrationState {
   }
 
   std::vector<GetMasterRegistrationData> registration_data;
+  // Empty when any master's answer is taken.
+  const std::string expected_permanent_uuid;
 
   std::mutex mutex;
   // Following fields are protected by mutex.
   std::condition_variable is_done_condition;
   GetMasterRegistrationData* first_success = nullptr;
-  GetMasterRegistrationData* last_registration = nullptr;
+  // The failure of the last RPC to complete without a success.
+  Status last_failure;
   size_t num_pending_rpcs;
 
   // Returns true once we have a result: either a success or all RPCs completed.
@@ -119,10 +124,12 @@ bool DoesRegistrationMatch(
 Status GetMasterEntryForHosts(rpc::ProxyCache* proxy_cache,
                               const std::vector<HostPort>& hostports,
                               MonoDelta timeout,
-                              ServerEntryPB* server_entry) {
+                              ServerEntryPB* server_entry,
+                              const std::string& expected_permanent_uuid) {
   CHECK(!hostports.empty());
 
-  auto state = std::make_shared<GetMasterRegistrationState>(proxy_cache, hostports);
+  auto state = std::make_shared<GetMasterRegistrationState>(
+      proxy_cache, hostports, expected_permanent_uuid);
 
   for (auto& data : state->registration_data) {
     data.controller.set_timeout(timeout);
@@ -132,12 +139,20 @@ Status GetMasterEntryForHosts(rpc::ProxyCache* proxy_cache,
       bool already_done = state->IsDone();
 
       state->num_pending_rpcs--;
-      state->last_registration = &data;
 
-      if (data.controller.status().ok() && !data.resp.has_error()) {
-        if (!state->first_success) {
-          state->first_success = &data;
-        }
+      if (!data.controller.status().ok()) {
+        state->last_failure = data.controller.status();
+      } else if (data.resp.has_error()) {
+        state->last_failure = StatusFromPB(data.resp.error().status());
+      } else if (!state->expected_permanent_uuid.empty() &&
+                 data.resp.instance_id().permanent_uuid() != state->expected_permanent_uuid) {
+        // The address is another master's now (a peer's last known address, given to another
+        // master since): its answer is not this master's.
+        state->last_failure = STATUS_FORMAT(
+            NotFound, "$0 answered as master $1, not $2", data.proxy.proxy().remote(),
+            data.resp.instance_id().permanent_uuid(), state->expected_permanent_uuid);
+      } else if (!state->first_success) {
+        state->first_success = &data;
       }
 
       // Only notify the first time we have a result.
@@ -160,11 +175,7 @@ Status GetMasterEntryForHosts(rpc::ProxyCache* proxy_cache,
     return Status::OK();
   }
 
-  if (state->last_registration->controller.status().ok()) {
-    return StatusFromPB(state->last_registration->resp.error().status());
-  } else {
-    return state->last_registration->controller.status();
-  }
+  return state->last_failure;
 }
 
 const HostPortPB& DesiredHostPort(const TSInfoPB& ts_info, const CloudInfoPB& from) {

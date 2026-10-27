@@ -695,6 +695,34 @@ TEST_F_EX(MasterPathHandlersItest, Forward, MultiMasterPathHandlersItest) {
   }
 }
 
+// ListMasters names each peer by the peer's own answer. A peer's last known address may be another
+// master's now (its container or instance given a new address, and the old one given to another
+// master): here every peer's addresses include the first master's, and the other two masters are
+// down, so the first master's answer is the only one. Each of the two is listed by its own uuid,
+// with an error, never as the first master.
+TEST_F_EX(MasterPathHandlersItest, ListMastersTakesOnlyEachPeersOwnAnswer,
+          MultiMasterPathHandlersItest) {
+  auto* answering = cluster_->mini_master(0);
+  const std::multiset<std::string> every_master{
+      answering->permanent_uuid(), cluster_->mini_master(1)->permanent_uuid(),
+      cluster_->mini_master(2)->permanent_uuid()};
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_TEST_master_extra_list_host_port) =
+      answering->bound_rpc_addr().ToString();
+  cluster_->mini_master(1)->Shutdown();
+  cluster_->mini_master(2)->Shutdown();
+
+  std::vector<ServerEntryPB> masters;
+  ASSERT_OK(answering->master()->ListMasters(&masters));
+  std::multiset<std::string> listed;
+  for (const auto& entry : masters) {
+    listed.insert(entry.instance_id().permanent_uuid());
+    if (entry.instance_id().permanent_uuid() != answering->permanent_uuid()) {
+      ASSERT_TRUE(entry.has_error()) << entry.ShortDebugString();
+    }
+  }
+  ASSERT_EQ(listed, every_master);
+}
+
 class TabletSplitMasterPathHandlersItest : public MasterPathHandlersItest {
  public:
   void SetUp() override {
@@ -1439,6 +1467,25 @@ TEST_F(MasterPathHandlersEarlyReturnItest, GetMasterEntryForHostsReturnsEarlyOnS
   ASSERT_LT(elapsed.ToSeconds(), 5)
       << "GetMasterEntryForHosts took too long (" << elapsed.ToSeconds()
       << "s), early return not working.";
+}
+
+// With the uuid of the master the addresses are expected to reach, another master's answer is not
+// taken for it.
+TEST_F(MasterPathHandlersExternalItest, GetMasterEntryForHostsTakesOnlyTheExpectedMaster) {
+  auto* expected = cluster_->master(1);
+  auto* other = cluster_->master(0);
+
+  ServerEntryPB entry;
+  ASSERT_OK(master::GetMasterEntryForHosts(
+      &cluster_->proxy_cache(), {other->bound_rpc_hostport(), expected->bound_rpc_hostport()},
+      MonoDelta::FromSeconds(30), &entry, expected->uuid()));
+  ASSERT_EQ(entry.instance_id().permanent_uuid(), expected->uuid());
+
+  ServerEntryPB another;
+  auto status = master::GetMasterEntryForHosts(
+      &cluster_->proxy_cache(), {other->bound_rpc_hostport()}, MonoDelta::FromSeconds(30),
+      &another, expected->uuid());
+  ASSERT_TRUE(status.IsNotFound()) << status << ": " << another.ShortDebugString();
 }
 
 template <int RF>
